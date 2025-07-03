@@ -139,7 +139,7 @@ XX(low, model_number, none, low, __VA_ARGS__) \
 XX(high, model_number, none, high, __VA_ARGS__)
 
 #define ZITI_INTERCEPT_CFG_V1 "intercept.v1"
-#define ZITI_CLIENT_CFG_V1 "ziti-tunneler-client.v1"
+#define ZITI_CLIENT_CFG_V1 "idn-tunneler-client.v1"
 
 #define ZITI_INTERCEPT_CFG_V1_MODEL(XX, ...) \
 XX(protocols, ziti_protocol, list, protocols, __VA_ARGS__) \
@@ -220,7 +220,11 @@ typedef struct ziti_address_s {
     } addr;
 } ziti_address;
 
-
+typedef struct intercept_p {
+    const ziti_address *ip4;
+    const ziti_address *ip6;
+    const ziti_address *ip;
+} interp;
 
 
 // make sure ziti model functions are properly exported

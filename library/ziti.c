@@ -220,7 +220,7 @@ void ziti_set_auth_started(ziti_context ztx) {
 
 void ziti_set_unauthenticated(ziti_context ztx, const ziti_error *err) {
     if (err) {
-        ZTX_LOG(WARN, "auth error: %s", err->message);
+        ZITI_LOG(WARN, "auth error: %s", err->message);
     }
 
     ZTX_LOG(DEBUG, "setting auth_state[%d] to %d", ztx->auth_state, ZitiAuthStateUnauthenticated);
@@ -412,25 +412,19 @@ void ziti_set_fully_authenticated(ziti_context ztx, const char *session_token) {
     }
 
     if (ztx->id_creds.cert == NULL && ztx->session_creds.cert == NULL) {
-        char common_name[65]; // X509.CN has a limit of 64 chars
-        // maybe hash session token?
-        snprintf(common_name, sizeof(common_name), "ziti-%u-%" PRIu64,
+        char common_name[128];
+        snprintf(common_name, sizeof(common_name), "%s-%u-%" PRIu64,
+                 APP_ID ? APP_ID : "ziti-sdk-c",
                  ztx->id, uv_now(ztx->loop));
 
-        ZTX_LOG(DEBUG, "creating session CSR with CN=%s", common_name);
         size_t csr_len;
-        int rc = ztx->tlsCtx->generate_csr_to_pem(pk, &ztx->sessionCsr, &csr_len,
-                                                  "O", "OpenZiti",
-                                                  "OU", "ziti-sdk",
-                                                  "CN", common_name,
-                                                  NULL);
-        if (rc != 0) {
-            ZTX_LOG(ERROR, "failed to generate CSR for session cert");
-        } else {
-            ZTX_LOG(DEBUG, "sending CSR to sign");
-            ZTX_LOG(DEBUG, "%.*s", (int)csr_len, ztx->sessionCsr);
-            ziti_ctrl_create_api_certificate(ztx_get_controller(ztx), ztx->sessionCsr, on_create_cert, ztx);
-        }
+        ztx->tlsCtx->generate_csr_to_pem(pk, &ztx->sessionCsr, &csr_len,
+                                         "O", "OpenZiti",
+                                         "OU", "ziti-sdk",
+                                         "CN", common_name,
+                                         NULL);
+
+        ziti_ctrl_create_api_certificate(ztx_get_controller(ztx), ztx->sessionCsr, on_create_cert, ztx);
     }
 
     ziti_services_refresh(ztx, true);
@@ -514,7 +508,7 @@ static void ziti_start_internal(ziti_context ztx, void *init_req) {
 
         int rc = load_tls(&ztx->config, &ztx->tlsCtx, &ztx->id_creds);
         if (rc != 0) {
-            ZTX_LOG(ERROR, "invalid TLS config: %s", ziti_errorstr(rc));
+            ZITI_LOG(ERROR, "invalid TLS config: %s", ziti_errorstr(rc));
             ziti_event_t ev = {
                     .type = ZitiContextEvent,
                     .ctx = {
@@ -597,7 +591,7 @@ static int ztx_init_controller(ziti_context ztx) {
 
     int rc = ziti_ctrl_init(ztx->loop, &ztx->ctrl, &ztx->config.controllers, ztx->tlsCtx);
     if (rc != 0) {
-        ZTX_LOG(ERROR, "no valid controllers found");
+        ZITI_LOG(ERROR, "no valid controllers found");
         ev.ctx.ctrl_status = rc;
         ziti_send_event(ztx, &ev);
         return ZITI_INVALID_CONFIG;
@@ -1107,7 +1101,7 @@ const ziti_service *ziti_service_for_addr_str(ziti_context ztx, ziti_protocol pr
     if (parse_ziti_address_str(&a, addr) != -1) {
         return ziti_service_for_addr(ztx, proto, &a, port);
     }
-    ZTX_LOG(WARN, "invalid address host[%s]", addr);
+    ZITI_LOG(WARN, "invalid address host[%s]", addr);
     return NULL;
 }
 
@@ -1600,11 +1594,11 @@ static void ca_bundle_cb(char *pkcs7, const ziti_error *err, void *ctx) {
         size_t pem_size;
 
         if (ztx->tlsCtx->parse_pkcs7_certs(&new_bundle, pkcs7, strlen((pkcs7)))) {
-            ZTX_LOG(ERROR, "failed to parse updated CA bundle");
+            ZITI_LOG(ERROR, "failed to parse updated CA bundle");
             goto error;
         }
         if (new_bundle->to_pem(new_bundle, 1, &new_pem, &pem_size)) {
-            ZTX_LOG(ERROR, "failed to format new CA bundle");
+            ZITI_LOG(ERROR, "failed to format new CA bundle");
             goto error;
         }
 
@@ -1619,7 +1613,7 @@ static void ca_bundle_cb(char *pkcs7, const ziti_error *err, void *ctx) {
             ztx_config_update(ztx);
         }
     } else {
-        ZTX_LOG(ERROR, "failed to get CA bundle from controller: %s", err->message);
+        ZITI_LOG(ERROR, "failed to get CA bundle from controller: %s", err->message);
     }
 
     error:
@@ -1683,16 +1677,14 @@ static void grim_reaper(ziti_context ztx) {
     }
 }
 
-void do_ztx_set_deadline(ziti_context ztx, uint64_t timeout, deadline_t *d, void (*cb)(void *), const char *cb_name, void *ctx) {
+void ztx_set_deadline(ziti_context ztx, uint64_t timeout, deadline_t *d, void (*cb)(void *), void *ctx) {
     assert(cb != NULL);
-    ZTX_LOG(DEBUG, "expire_cb[%s] timeout[%llu]", cb_name, timeout);
     clear_deadline(d);
 
     uint64_t now = uv_now(ztx->loop);
     d->expiration = now + timeout;
     d->ctx = ctx;
     d->expire_cb = cb;
-    d->expire_cb_name = cb_name;
 
     if (LIST_EMPTY(&ztx->deadlines)) {
         LIST_INSERT_HEAD(&ztx->deadlines, d, _next);
@@ -1719,21 +1711,15 @@ void do_ztx_set_deadline(ziti_context ztx, uint64_t timeout, deadline_t *d, void
 
 static void ztx_process_deadlines(uv_timer_t *t) {
     ziti_context ztx = t->data;
-    uint8_t n = 0;
     uint64_t now = uv_now(ztx->loop);
-    deadline_t *d;
+    deadline_t *d ;
     while ((d = LIST_FIRST(&ztx->deadlines)) && now > d->expiration) {
         LIST_REMOVE(d, _next);
 
         void *ctx = d->ctx;
         void (*cb)(void *) = d->expire_cb;
         d->expire_cb = NULL;
-        ZTX_LOG(DEBUG, "calling %s(%p)", d->expire_cb_name, d->ctx);
-        n++;
         cb(d->ctx);
-    }
-    if (n == 0) {
-        ZTX_LOG(TRACE, "no deadlines expired");
     }
 }
 
@@ -1746,7 +1732,6 @@ static void ztx_prep_deadlines(ziti_context ztx) {
     deadline_t *next = LIST_FIRST(&ztx->deadlines);
     uint64_t now = uv_now(ztx->loop);
     uint64_t wait_time = next->expiration > now ? next->expiration - now : 0;
-    ZTX_LOG(TRACE, "processing deadlines in %llu ms", wait_time);
     uv_timer_start(&ztx->deadline_timer, ztx_process_deadlines, wait_time, 0);
 }
 
@@ -1863,11 +1848,11 @@ void ziti_queue_work(ziti_context ztx, ztx_work_f w, void *data) {
 static void copy_oidc(ziti_context ztx, const ziti_jwt_signer *oidc) {
     if (oidc == NULL) return;
     if (oidc->provider_url == NULL) {
-        ZTX_LOG(ERROR, "invalid OIDC config `externalAuthUrl` is missing");
+        ZITI_LOG(ERROR, "invalid OIDC config `externalAuthUrl` is missing");
         return;
     }
     if (oidc->client_id == NULL) {
-        ZTX_LOG(ERROR, "invalid OIDC config `clientId` is missing");
+        ZITI_LOG(ERROR, "invalid OIDC config `clientId` is missing");
         return;
     }
 
@@ -2033,7 +2018,7 @@ static void version_pre_auth_cb(const ziti_version *version, const ziti_error *e
         enum AuthenticationMethod m = ha ? HA : LEGACY;
 
         if (ztx->auth_method && ztx->auth_method->kind != m) {
-            ZTX_LOG(INFO, "current auth method does not match controller, switching to %s method",
+            ZITI_LOG(INFO, "current auth method does not match controller, switching to %s method",
                      ha ? "HA" : "LEGACY");
             ztx->auth_method->stop(ztx->auth_method);
             ztx->auth_method->free(ztx->auth_method);

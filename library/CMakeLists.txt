@@ -47,20 +47,7 @@ if (ziti_DEVELOPER_MODE)
     endif ()
 endif ()
 
-pkg_check_modules(JSONC json-c)
-if (TARGET PkgConfig::JSONC)
-    set(jsonc_libs PkgConfig::JSONC)
-    message(STATUS "Using PkgConfig::JSONC target")
-else()
-    find_package(json-c REQUIRED)
-    if (TARGET json-c::json-c)
-        set(jsonc_libs json-c::json-c)
-        message(STATUS "Using json-c::json-c target")
-    else()
-        message(FATAL_ERROR "Could not find required library [json-c]")
-    endif()
-endif()
-
+find_package(json-c CONFIG REQUIRED)
 
 set(ZITI_HEADER_FILES
         ${PROJECT_SOURCE_DIR}/includes/ziti/errors.h
@@ -124,18 +111,6 @@ set(ziti_compile_defs
         PRIVATE ZITI_LOG_MODULE="${PROJECT_NAME}"
 )
 
-function(define_file_basename_for_sources targetname)
-    get_target_property(source_files "${targetname}" SOURCES)
-    foreach(sourcefile ${source_files})
-        # Add the FILE_BASENAME=filename compile definition to the list.
-        get_filename_component(basename "${sourcefile}" NAME)
-        # Set the updated compile definitions on the source file.
-        set_property(
-                SOURCE "${sourcefile}" APPEND
-                PROPERTY COMPILE_DEFINITIONS "FILE_BASENAME=\"${basename}\"")
-    endforeach()
-endfunction()
-
 function(config_ziti_library target)
     target_sources(${target} PRIVATE
             ${ZITI_SRC_FILES}
@@ -158,7 +133,7 @@ function(config_ziti_library target)
     target_link_libraries(${target} PUBLIC
             tlsuv
             ${sodium_libs}
-            ${jsonc_libs}
+            json-c::json-c
             PkgConfig::PBUFC
     )
 
@@ -189,7 +164,6 @@ function(config_ziti_library target)
             COMPONENT ziti-sdk
             DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
-    define_file_basename_for_sources(${target})
 endfunction(config_ziti_library)
 
 add_library(ziti STATIC)

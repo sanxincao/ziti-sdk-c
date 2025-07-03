@@ -125,6 +125,8 @@ static const char *get_elapsed_time();
 
 static const char *get_utc_time();
 
+static const char *get_cst_time();
+
 static void default_log_writer(int level, const char *loc, const char *msg, size_t msglen);
 
 static uv_loop_t *ts_loop;
@@ -132,14 +134,86 @@ static uint64_t starttime;
 static uint64_t last_update;
 static char log_timestamp[32];
 
+static uv_key_t logbufs;
+
 static log_writer logger = NULL;
 
 static void init_debug(uv_loop_t *loop);
 
 static void init_uv_mbed_log();
 
+/* 日志关键字替换表 */
+static struct {
+    const char *old_str;
+    const char *new_str;
+} keyword_replacements[] = {
+        {"ziti",  "idn"},  // 示例替换规则
+        {NULL, NULL}         // 结束标记
+};
+/* 不区分大小写的字符比较 */
+static int ci_compare(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    return a - b;
+}
+/* 允许变长替换 */
+static void replace_keywords(char *str, size_t max_len) {
+    char *buffer = malloc(max_len);
+    if (!buffer)
+        return;
+
+    size_t buf_idx = 0;
+    const size_t str_len = strlen(str);
+
+    for (size_t i = 0; i < str_len && buf_idx < max_len - 1; ) {
+        bool replaced = false;
+
+        // 遍历所有替换规则
+        for (int r = 0; keyword_replacements[r].old_str; r++) {
+            const char *old = keyword_replacements[r].old_str;
+            const char *new_str = keyword_replacements[r].new_str;
+            const size_t old_len = strlen(old);
+            const size_t new_len = strlen(new_str);
+
+            // 检查剩余长度是否足够
+            if (i + old_len > str_len) continue;
+
+            // 不区分大小写比较
+            bool match = true;
+            for (size_t j = 0; j < old_len; j++) {
+                if (ci_compare(str[i + j], old[j]) != 0) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match && (buf_idx + new_len < max_len)) {
+                // 执行替换
+                memcpy(&buffer[buf_idx], new_str, new_len);
+                buf_idx += new_len;
+                i += old_len;
+                replaced = true;
+                break;
+            }
+        }
+
+        if (!replaced) {
+            buffer[buf_idx++] = str[i++];
+        }
+    }
+
+    buffer[buf_idx] = '\0';
+    strncpy(str, buffer, max_len);
+}
+
 void ziti_log_init(uv_loop_t *loop, int level, log_writer log_func) {
     init_uv_mbed_log();
+
+#ifdef _WIN32
+    _putenv_s("ZITI_TIME_FORMAT", "CST");
+#else
+    setenv("ZITI_TIME_FORMAT", "CST", 1);
+#endif
 
     init_debug(loop);
 
@@ -148,7 +222,6 @@ void ziti_log_init(uv_loop_t *loop, int level, log_writer log_func) {
     }
 
     if (log_func == NULL) {
-        // keep the logger if it was already set
         ziti_log_set_logger(logger ? logger : default_log_writer);
     } else {
         ziti_log_set_logger(log_func);
@@ -165,8 +238,8 @@ void ziti_log_init(uv_loop_t *loop, int level, log_writer log_func) {
     ZITI_LOG(INFO, "Ziti C SDK version %s @%s(%s) starting at (%s.%03d)",
             ziti_get_build_version(false), ziti_git_commit(), ziti_git_branch(),
             time_str, start_time.tv_usec / 1000);
-
 }
+
 
 void ziti_log_set_level(int level, const char *marker) {
     if (level > TRACE) {
@@ -260,11 +333,18 @@ static void init_debug(uv_loop_t *loop) {
 #if defined(PTHREAD_ONCE_INIT)
     pthread_atfork(NULL, NULL, child_init);
 #endif
+    uv_key_create(&logbufs);
     log_pid = uv_os_getpid();
     get_elapsed = get_elapsed_time;
+    
+    #ifdef _WIN32
+        _putenv_s("ZITI_TIME_FORMAT", "CST");
+    #else
+        setenv("ZITI_TIME_FORMAT", "CST", 1);
+    #endif
     char *ts_format = getenv("ZITI_TIME_FORMAT");
-    if (ts_format && strcasecmp("utc", ts_format) == 0) {
-        get_elapsed = get_utc_time;
+    if (ts_format && strcasecmp("CST", ts_format) == 0) {
+        get_elapsed = get_cst_time;
     }
     ts_loop = loop;
     log_initialized = true;
@@ -276,7 +356,7 @@ static void init_debug(uv_loop_t *loop) {
     // always log TLSUV errors
     ziti_log_set_level(ERROR, TLSUV_MODULE);
     model_list levels = {0};
-    str_split(getenv("ZITI_LOG"), ";", &levels);
+    str_split(getenv("IDN_LOG"), ";", &levels);
 
     const char *lvl;
     int l;
@@ -317,62 +397,68 @@ static const char *basename(const char *path) {
     return path;
 }
 
-#ifdef ZITI_DEBUG
-#define LOG_LINE_LENGTH 32768
-#else
-#define LOG_LINE_LENGTH 1024
-#endif
+void ziti_logger(int level, const char *module, const char *file, unsigned int line,
+    const char *func, const char *fmt, ...) {
+    static size_t loglinelen = 1024;
 
-static THREAD_LOCAL char log_buf[LOG_LINE_LENGTH];
-
-void ziti_logger(int level, const char *module, const char *file, unsigned int line, const char *func, FORMAT_STRING(const char *fmt), ...) {
+    /* 获取日志写入函数（如果未设置则直接返回） */
     log_writer logfunc = logger;
     if (logfunc == NULL) { return; }
 
+    /* 获取线程特定的日志缓冲区 */
+    char *logbuf = (char *) uv_key_get(&logbufs);
+    if (!logbuf) {
+        logbuf = malloc(loglinelen);
+        uv_key_set(&logbufs, logbuf);
+    }
+
+    /* 生成位置标识 */
     char location[128];
     char *last_slash = strrchr(file, DIR_SEP);
 
+    /* 确定模块显示长度 */
     int modlen = 16;
     if (module == NULL) {
-        if (last_slash == NULL) {
-            modlen = 0;
-        }
-        else {
-            char *p = last_slash;
-            while (p > file) {
-                p--;
-                if (*p == DIR_SEP) {
-                    p++;
-                    break;
-                }
+    if (last_slash == NULL) {
+        modlen = 0;
+    } else {
+        /* 从文件路径中提取模块名 */
+        char *p = last_slash;
+        while (p > file) {
+            if (*--p == DIR_SEP) {
+                p++;
+                break;
             }
-            module = p;
-            modlen = (int) (last_slash - p);
         }
+        module = p;
+        modlen = (int) (last_slash - p);
+    }
     }
 
-    if (last_slash) {
-        file = last_slash + 1;
-    }
+    /* 简化文件名显示 */
+    if (last_slash) file = last_slash + 1;
+
+    /* 生成位置信息并执行替换 */
     if (func && func[0]) {
         snprintf(location, sizeof(location), "%.*s:%s:%u %s()", modlen, module, file, line, func);
-    }
-    else {
+    } else {
         snprintf(location, sizeof(location), "%.*s:%s:%u", modlen, module, file, line);
     }
+    replace_keywords(location, sizeof(location)); // 位置信息替换
 
+    /* 格式化日志内容 */
     va_list argp;
     va_start(argp, fmt);
-    int len = vsnprintf(log_buf, sizeof(log_buf), fmt, argp);
+    int len = vsnprintf(logbuf, loglinelen, fmt, argp);
     va_end(argp);
 
-    if (len > sizeof(log_buf)) {
-        len = (int) sizeof(log_buf);
-    }
+    /* 执行日志内容替换并控制长度 */
+    replace_keywords(logbuf, loglinelen); // 内容替换
+    if (len > loglinelen) len = (int) loglinelen;
 
-    logfunc(level, location, log_buf, len);
+    /* 最终输出（同时处理location和logbuf的替换结果） */
+    logfunc(level, location, logbuf, len);
 }
-
 static void default_log_writer(int level, const char *loc, const char *msg, size_t msglen) {
     const char *elapsed = get_elapsed();
     fprintf(ziti_debug_out, "(%u)[%s] %7s %s %.*s\n", log_pid, elapsed, level_labels[level], loc, (unsigned int) msglen, msg);
@@ -391,6 +477,36 @@ static const char *get_elapsed_time() {
     }
     return log_timestamp;
 }
+
+static const char *get_cst_time() {
+    static bool tz_set = false;
+    if (!tz_set) {        
+        #ifdef _WIN32
+            _putenv_s("TZ", "Asia/Shanghai");
+        #else
+            setenv("TZ", "Asia/Shanghai", 1);
+        #endif
+        tzset(); // 让 localtime 使用新的 TZ 设置
+        tz_set = true;
+    }
+
+    uint64_t now = uv_now(ts_loop);
+    if (now > last_update) {
+        last_update = now;
+
+        uv_timeval64_t ts;
+        uv_gettimeofday(&ts);
+        time_t t = ts.tv_sec;
+        struct tm *tm = localtime(&t);
+
+        snprintf(log_timestamp, sizeof(log_timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.%03dCST",
+                 1900 + tm->tm_year, tm->tm_mon + 1, tm->tm_mday,
+                 tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_usec / 1000);
+    }
+
+    return log_timestamp;
+}
+
 
 static const char *get_utc_time() {
     uint64_t now = uv_now(ts_loop);
@@ -454,7 +570,7 @@ void ziti_fmt_time(char* time_str, size_t time_str_sz, uv_timeval64_t* tv) {
         strncpy(time_str, "null tv", time_str_sz);
     } else {
         time_t t = tv->tv_sec;
-        struct tm* start_tm = gmtime(&t);
+        struct tm* start_tm = localtime(&t);
         strftime(time_str, time_str_sz, "%Y-%m-%dT%H:%M:%S", start_tm);
     }
 }

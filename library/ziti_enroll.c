@@ -427,6 +427,7 @@ static void enroll_cb(ziti_enrollment_resp *resp, const ziti_error *err, void *e
     }
 
     ZITI_LOG(DEBUG, "successfully enrolled with controller %s", er->controller.url);
+    ZITI_LOG(INFO, "successfully enrolled");
     er->cfg.id.cert = resp->cert ? strdup(resp->cert) : strdup(er->opts.cert);
 
     complete_request(er, ZITI_OK);

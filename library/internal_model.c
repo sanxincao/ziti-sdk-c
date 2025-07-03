@@ -355,7 +355,7 @@ int ziti_address_match(const ziti_address *addr, const ziti_address *range) {
                     bits = bits - 8;
                     mask = 0xff;
                 } else {
-                    mask = 0xff << bits;
+                    mask = 0xff << (8 - bits);
                     bits = 0;
                 }
 
