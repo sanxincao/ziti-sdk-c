@@ -1677,7 +1677,7 @@ static void grim_reaper(ziti_context ztx) {
     }
 }
 
-void ztx_set_deadline(ziti_context ztx, uint64_t timeout, deadline_t *d, void (*cb)(void *), void *ctx) {
+void do_ztx_set_deadline(ziti_context ztx, uint64_t timeout, deadline_t *d, void (*cb)(void *), const char *cb_name, void *ctx) {
     assert(cb != NULL);
     clear_deadline(d);
 
